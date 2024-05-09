@@ -31,6 +31,27 @@ fn main() -> anyhow::Result<()> {
 
 			println!("{}", schema_records.iter().map(|sr| sr.name.as_ref()).join(" "));
 		}
+		sql if command[..7].to_ascii_lowercase() == "select " => {
+			let sql = sql.to_lowercase();
+			let table = sql
+				.strip_prefix("select count(*) from ")
+				.and_then(|t| t.ends_with(|c: char| c.is_ascii_alphanumeric()).then_some(t))
+				.context("expected `SELECT COUNT(*) FROM <table>` argument")?;
+
+			let (first_page, mut file) = read_first_page(database_path.as_ref())
+				.context("reading first page")?;
+			let file_header = first_page.file_header.as_ref().expect("first page has file header");
+
+			let schema_record = parse_schema_records(&first_page)
+				.find(|sr| !sr.as_ref().is_ok_and(|sr| sr.name != table))
+				.context("no matching schema record")?
+				.with_context(|| format!("retrieving schema record for table {table}"))?;
+
+			let table_page = read_page(&mut file, file_header, schema_record.root_page)
+				.with_context(|| format!("reading page {}", schema_record.root_page))?;
+
+			println!("{}", table_page.num_cells);
+		}
 		_ => anyhow::bail!("unsupported command {command:?}"),
 	}
 
