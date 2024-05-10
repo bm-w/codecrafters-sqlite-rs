@@ -12,8 +12,8 @@ fn main() -> anyhow::Result<()> {
 
 	match command.as_str() {
 		".dbinfo" => {
-			let (page, _file) = read_first_page(database_path.as_ref())
-				.context("reading first page")?;
+			let (page, _file) = parse_first_page(database_path.as_ref())
+				.context("parsing first page")?;
 			let header = &page.file_header.expect("first page has file header");
 
 			println!("database page size: {}", header.page_size);
@@ -22,8 +22,8 @@ fn main() -> anyhow::Result<()> {
 			println!("number of tables: {}", page.num_cells);
 		}
 		".tables" => {
-			let (page, _file) = read_first_page(database_path.as_ref())
-				.context("reading first page")?;
+			let (page, _file) = parse_first_page(database_path.as_ref())
+				.context("parsing first page")?;
 
 			let mut schema_records = parse_schema_records(&page)
 				.collect::<anyhow::Result<Vec<_>>>()?;
@@ -31,24 +31,43 @@ fn main() -> anyhow::Result<()> {
 
 			println!("{}", schema_records.iter().map(|sr| sr.name.as_ref()).join(" "));
 		}
-		sql if command[..7].to_ascii_lowercase() == "select " => {
-			let sql = sql.to_lowercase();
-			let table = sql
-				.strip_prefix("select count(*) from ")
-				.and_then(|t| t.ends_with(|c: char| c.is_ascii_alphanumeric()).then_some(t))
-				.context("expected `SELECT COUNT(*) FROM <table>` argument")?;
+		sql if !sql.starts_with('.') => {
+			anyhow::ensure!(sql.len() >= 6 && sql[..6].eq_ignore_ascii_case("select"),
+				"expected `SELECT` token");
+			let sql = sql[6..].strip_prefix(|c: char| c.is_ascii_whitespace())
+				.context("expected ASCII whitespace after `SELECT` token")?;
+			let (select_expr, sql) = sql.split_once(|c: char| c.is_ascii_whitespace())
+				.context("expected ASCII whitespace after `<select expression>` token")?;
+			let sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+			anyhow::ensure!(sql.len() >= 4 && sql[..4].eq_ignore_ascii_case("from"),
+				"expected `FROM` token");
+			let sql = sql[4..].strip_prefix(|c: char| c.is_ascii_whitespace())
+				.context("expected ASCII whitespace after `FROM` token")?;
+			let table_expr = sql.trim_end_matches(|c: char| c.is_ascii_whitespace());
 
-			let (first_page, mut file) = read_first_page(database_path.as_ref())
-				.context("reading first page")?;
+			fn validate_sql_ident(token: &str) -> anyhow::Result<()> {
+				anyhow::ensure!(token.starts_with(|c: char| c.is_ascii_alphabetic()),
+					"expected identifier to start with ASCII alphabetic character");
+				anyhow::ensure!(token.chars().skip(1)
+					.all(|c: char| c.is_ascii_alphanumeric() || c == '_'),
+					"epected identifier contains only ASCII alphanumerics or underscores");
+				Ok(())
+			}
+			let is_all_rows_count = select_expr.eq_ignore_ascii_case("count(*)");
+			anyhow::ensure!(is_all_rows_count, "expected `COUNT(*)` token");
+			validate_sql_ident(table_expr)?;
+
+			let (first_page, mut file) = parse_first_page(database_path.as_ref())
+				.context("parsing first page")?;
 			let file_header = first_page.file_header.as_ref().expect("first page has file header");
 
 			let schema_record = parse_schema_records(&first_page)
-				.find(|sr| !sr.as_ref().is_ok_and(|sr| sr.name != table))
-				.context("no matching schema record")?
-				.with_context(|| format!("retrieving schema record for table {table}"))?;
+				.find(|r| !r.as_ref().is_ok_and(|sr| sr.name != table_expr))
+				.with_context(|| format!("no matching schema record for table {table_expr:?}"))?
+				.context("parsing schema records")?;
 
-			let table_page = read_page(&mut file, file_header, schema_record.root_page)
-				.with_context(|| format!("reading page {}", schema_record.root_page))?;
+			let table_page = parse_page(&mut file, file_header, schema_record.root_page)
+				.with_context(|| format!("parsing page {}", schema_record.root_page))?;
 
 			println!("{}", table_page.num_cells);
 		}
@@ -68,8 +87,83 @@ struct SchemaRecord<'a> {
 	sql: Cow<'a, str>,
 }
 
-fn parse_schema_records(page: &Page)
+fn parse_schema_records(first_page: &Page)
 -> impl Iterator<Item = anyhow::Result<SchemaRecord<'_>>> {
+	parse_records_fields(first_page).map(|record_fields| {
+		let (record, fields) = record_fields.context("parsing record fields")?;
+		let mut fields = fields.map(|r| r.context("parsing field"));
+
+		// `type` column
+		let (typ, table_type) = fields.next().context("expected `type` column field")??;
+		anyhow::ensure!(is_text_type(typ) && table_type == b"table",
+			"expected \"table\" text for `type` value");
+
+		// `name` column
+		let (typ, name) = fields.next().context("expected `name` column field")??;
+		anyhow::ensure!(is_text_type(typ), "expected text type for `name` column");
+		let name = std::str::from_utf8(name).expect("reading `name` value as UTF-8");
+
+		// `rootpage` column (skipping `tbl_name`)
+		let (typ, root_page) = fields.nth(1).context("expected `rootpage` column field")??;
+		let (_, root_page) = int_val(typ, root_page)
+			.context("reading `rootpage` integer value")?;
+		let root_page: u64 = root_page.context("expected non-NULL `rootpage` value")?
+			.try_into().context("expected non-negative `rootpage` value")?;
+		let root_page = root_page.try_into().context("expected non-zero `rootpage` column value")?;
+
+		let (typ, sql) = fields.next().context("expected `sql` column field")??;
+		anyhow::ensure!(is_text_type(typ), "expected text type for `sql` column");
+		let sql = std::str::from_utf8(sql).expect("reading `sql` value as UTF-8");
+
+		Ok(SchemaRecord {
+			id: record.rowid,
+			name: name.into(),
+			root_page,
+			sql: sql.into(),
+		})
+	})
+}
+
+fn parse_records_fields(page: &Page)
+-> impl Iterator<Item = anyhow::Result<(
+	Record<'_>,
+	impl Iterator<Item = anyhow::Result<(i64, &[u8])>>
+)>> {
+	parse_records(page).map(|record| {
+		let record = record.context("parsing record")?;
+
+		let (size, record_header_len) = parse_varint(record.payload)
+			.context("parsing first cell’s payload size `varint`")?;
+		let record_header_len = record_header_len as usize;
+
+		let mut type_offset = size;
+		let mut val_offset = record_header_len;
+
+		let payload = record.payload;
+
+		Ok((record, std::iter::from_fn(move || {
+			if type_offset == record_header_len { return None }
+
+			fn inner<'a>(payload: &'a [u8], type_offset: &mut usize, val_offset: &mut usize)
+			-> anyhow::Result<(i64, &'a [u8])> {
+				let (size, typ) = parse_varint(&payload[*type_offset..]).context("parsing type")?;
+				*type_offset += size;
+				let size = val_len(typ).context("computing value length")?;
+				let val = &payload[*val_offset..*val_offset + size];
+				*val_offset += size;
+				Ok((typ, val))
+			}
+			Some(inner(payload, &mut type_offset, &mut val_offset))
+		})))
+	})
+}
+
+struct Record<'a> {
+	rowid: NonZeroU64,
+	payload: &'a [u8],
+}
+
+fn parse_records(page: &Page) -> impl Iterator<Item = anyhow::Result<Record<'_>>> {
 	let mut cell_offset = page.cells_offset
 		- page.file_header.as_ref().map(|h| h.buf.len()).unwrap_or(0);
 
@@ -84,69 +178,11 @@ fn parse_schema_records(page: &Page)
 		let rowid: u64 = rowid.try_into().context("expected non-negative `rowid`")?;
 		let rowid = rowid.try_into().context("expected non-zero `rowid`")?;
 
-		let record_header_len_offset = rowid_offset + size;
-		let (size, record_header_len) = parse_varint(&page.buf[record_header_len_offset..])
-			.context("parsing first cell’s payload size `varint`")?;
-		let record_header_len = record_header_len as usize;
+		let payload_offset = rowid_offset + size;
 
-		let types_offset = record_header_len_offset + size;
+		cell_offset = payload_offset + payload_len;
 
-		// `type` column (text "table" of length (23 - 13) / 2 == 5)
-		anyhow::ensure!(page.buf[types_offset] == 23, "expected text type of length 5");
-
-		// `name` column
-		let name_typ_offset = types_offset + 1;
-		let (size, typ) = parse_varint(&page.buf[name_typ_offset..])
-			.context("parsing `name` column type")?;
-		let name_len = text_typ_len(typ).context("parsing `name` column text length")?;
-
-		// `tbl_name` column
-		let tbl_name_typ_offset = name_typ_offset + size;
-		let (size, typ) = parse_varint(&page.buf[tbl_name_typ_offset..])
-			.context("parsing `tbl_name` column type")?;
-		let tbl_name_len = text_typ_len(typ).context("parsing `tbl_name` column text length")?;
-
-		// `rootpage` column
-		let rootpage_typ_offset = tbl_name_typ_offset + size;
-		let (size, rootpage_typ) = parse_varint(&page.buf[rootpage_typ_offset..])
-			.context("parsing `tbl_name` column type")?;
-
-		// `sql` column
-		let sql_typ_offset = rootpage_typ_offset + size;
-		let (size, typ) = parse_varint(&page.buf[sql_typ_offset..])
-			.context("parsing `tbl_name` column type")?;
-		let sql_len = text_typ_len(typ).context("parsing `tbl_name` column text length")?;
-
-		anyhow::ensure!(sql_typ_offset + size == record_header_len_offset + record_header_len,
-			"expected record header length of {} but got {}",
-			record_header_len_offset + record_header_len,
-			sql_typ_offset + size);
-
-		let record_body_offset = record_header_len_offset + record_header_len;
-
-		let name_offset = record_body_offset + 5; // 5 is length of type column value "table"
-		let name = std::str::from_utf8(&page.buf[name_offset..name_offset + name_len])
-			.context("reading `name` column value as UTF-8")?;
-
-		let rootpage_offset = name_offset + name_len + tbl_name_len;
-		let (size, root_page) = int_val(rootpage_typ, &page.buf[rootpage_offset..])
-			.context("reading `rootpage` column value")?;
-		let root_page: u64 = root_page.context("expected non-NULL `rootpage` column value")?
-			.try_into().context("expected non-negative `rootpage` column value")?;
-		let root_page = root_page.try_into().context("expected non-zero `rootpage` column value")?;
-
-		let sql_offset = rootpage_offset + size;
-		let sql = std::str::from_utf8(&page.buf[sql_offset..sql_offset + sql_len])
-			.context("reading `sql` column value as UTF-8")?;
-
-		cell_offset = record_header_len_offset + payload_len;
-
-		Ok(SchemaRecord {
-			id: rowid,
-			name: name.into(),
-			root_page,
-			sql: sql.into(),
-		})
+		Ok(Record { rowid, payload: &page.buf[payload_offset..payload_offset + payload_len] })
 	})
 }
 
@@ -169,14 +205,24 @@ fn int_val(typ: i64, buf: &[u8]) -> anyhow::Result<(usize, Option<i64>)> {
 		6 => Ok((8, Some(i64::from_be_bytes(try_arr(buf)?) as i64))),
 		8 => Ok((0, Some(0))),
 		9 => Ok((0, Some(1))),
-		_ => anyhow::bail!("expected an integer type")
+		_ => anyhow::bail!("expected integer type")
 	}
 }
 
-fn text_typ_len(typ: i64) -> anyhow::Result<usize> {
-	anyhow::ensure!(typ >= 13 && typ % 2 == 1, "expected text type");
-	Ok((typ as usize - 13) / 2)
+fn val_len(typ: i64) -> anyhow::Result<usize> {
+	Ok(match typ {
+		0..=4 => typ as usize,
+		5 => 6,
+		6 | 7 => 8,
+		8 | 9 => 9,
+		10 | 11 => anyhow::bail!("unexpected internal type"),
+		_blob_typ if typ >= 12 && typ % 2 == 0 => (typ as usize - 12) / 2,
+		text_typ if is_text_type(text_typ) => (typ as usize - 13) / 2,
+		_ => anyhow::bail!("unexpected type {typ}"),
+	})
 }
+
+fn is_text_type(typ: i64) -> bool { typ >= 13 && typ % 2 == 1 }
 
 fn parse_varint(buf: &[u8]) -> anyhow::Result<(usize, i64)> {
 	let mut bits = 0u64;
@@ -209,18 +255,15 @@ struct Page {
 	buf: Vec<u8>,
 }
 
-fn read_first_page(database_path: &Path) -> anyhow::Result<(Page, File)> {
-	let (file_header, mut file) = read_header(database_path).context("reading header")?;
-	let mut page = read_page(&mut file, &file_header, unsafe { NonZeroU64::new_unchecked(1) })
-		.context("reading first page")?;
+fn parse_first_page(database_path: &Path) -> anyhow::Result<(Page, File)> {
+	let (file_header, mut file) = parse_header(database_path).context("parsing header")?;
+	let mut page = parse_page(&mut file, &file_header, unsafe { NonZeroU64::new_unchecked(1) })?;
 	page.file_header = Some(file_header);
-
-	anyhow::ensure!(page.buf[0] == 0x0d, "expected first page to be a leaf table b-tree page");
 
 	Ok((page, file))
 }
 
-fn read_page(file: &mut File, file_header: &Header, num: NonZeroU64) -> anyhow::Result<Page> {
+fn parse_page(file: &mut File, file_header: &Header, num: NonZeroU64) -> anyhow::Result<Page> {
 	let is_first_page = num.get() == 1; // Page numbers are 1-indexed
 	let file_header_len = if is_first_page { file_header.buf.len() } else { 0 };
 
@@ -247,7 +290,7 @@ struct Header {
 	buf: [u8; 100]
 }
 
-fn read_header(database_path: &Path) -> anyhow::Result<(Header, File)> {
+fn parse_header(database_path: &Path) -> anyhow::Result<(Header, File)> {
 	let mut file = File::open(database_path)
 		.with_context(|| format!("opening database at {database_path:?}"))?;
 	let file_size = file.metadata().context("accesing file metadata")?.len() as usize;
