@@ -32,82 +32,125 @@ fn main() -> anyhow::Result<()> {
 			println!("{}", schema_records.iter().map(|sr| sr.name.as_ref()).join(" "));
 		}
 		sql if !sql.starts_with('.') => {
-			anyhow::ensure!(sql.len() >= 6 && sql[..6].eq_ignore_ascii_case("select"),
-				"expected `SELECT` token");
-			let sql = sql[6..].strip_prefix(|c: char| c.is_ascii_whitespace())
-				.context("expected ASCII whitespace after `SELECT` token")?;
-			let (select_expr, sql) = sql.split_once(|c: char| c.is_ascii_whitespace())
-				.context("expected ASCII whitespace after `<select expression>` token")?;
-			let sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
-			anyhow::ensure!(sql.len() >= 4 && sql[..4].eq_ignore_ascii_case("from"),
-				"expected `FROM` token");
-			let sql = sql[4..].strip_prefix(|c: char| c.is_ascii_whitespace())
-				.context("expected ASCII whitespace after `FROM` token")?;
-			let table_expr = sql.trim_end_matches(|c: char| c.is_ascii_whitespace());
-
-			fn validate_sql_ident(token: &str) -> anyhow::Result<()> {
-				anyhow::ensure!(token.starts_with(|c: char| c.is_ascii_alphabetic()),
-					"expected identifier to start with ASCII alphabetic character");
-				anyhow::ensure!(token.chars().skip(1)
-					.all(|c: char| c.is_ascii_alphanumeric() || c == '_'),
-					"epected identifier contains only ASCII alphanumerics or underscores");
-				Ok(())
-			}
-			let is_all_rows_count = select_expr.eq_ignore_ascii_case("count(*)");
-			if !is_all_rows_count { validate_sql_ident(select_expr)?; }
-			validate_sql_ident(table_expr)?;
+			let sql_select = parse_sql_select(sql).context("parsing SQL `SELECT` query")?;
 
 			let (first_page, mut file) = parse_first_page(database_path.as_ref())
 				.context("parsing first page")?;
 			let file_header = first_page.file_header.as_ref().expect("first page has file header");
 
 			let schema_record = parse_schema_records(&first_page)
-				.find(|r| !r.as_ref().is_ok_and(|sr| sr.name != table_expr))
-				.with_context(|| format!("no matching schema record for table {table_expr:?}"))?
+				.find(|r| !r.as_ref().is_ok_and(|sr| sr.name != sql_select.table_name))
+				.with_context(|| format!("no matching schema record for table {:?}", sql_select.table_name))?
 				.context("parsing schema records")?;
 
 			let table_page = parse_page(&mut file, file_header, schema_record.root_page)
 				.with_context(|| format!("parsing page {}", schema_record.root_page))?;
 
-			if is_all_rows_count {
-				println!("{}", table_page.num_cells);
-			} else {
-				let (col_idx, col) = parse_sql_create(table_expr, &schema_record.sql)
-					.with_context(|| format!("parsing SQL create statement for table {table_expr:?}"))?
-					.enumerate()
-					.find_map(|(i, r)| match r {
-						Ok(col) => (col.name == select_expr).then_some(Ok((i, col))),
-						Err(err) => Some(Err(err)),
-					})
-					.with_context(|| format!("no matching column for name {select_expr:?}"))?
-					.with_context(|| format!("parsing columns for table {table_expr:?}"))?;
-
-				let mut values = parse_records_fields(&table_page)
-					.map(|r| r.and_then(|(record, mut fields)| {
-						Ok(if col.is_rowid_alias {
-							(record.rowid, None)
-						} else {
-							let (typ, val) = fields.nth(col_idx)
-								.with_context(|| format!("expected record field for column {col_idx}"))?
-								.context("parsing record fields")?;
-							assert!(is_text_type(typ), "assuming text columns only (type: {typ})");
-							(record.rowid, Some(std::str::from_utf8(val)
-								.context("reading text value as UTF-8")?))
+			match sql_select.column {
+				SqlSelectColumn::Count(SqlSelectCount::All) =>
+					println!("{}", table_page.num_cells),
+				SqlSelectColumn::Ident(col_name) => {
+					let (col_idx, col) = parse_sql_create(sql_select.table_name, &schema_record.sql)
+						.with_context(|| format!("parsing SQL create statement for table {:?}", sql_select.table_name))?
+						.enumerate()
+						.find_map(|(i, r)| match r {
+							Ok(col) => (col.name == col_name).then_some(Ok((i, col))),
+							Err(err) => Some(Err(err)),
 						})
-					}))
-					.collect::<anyhow::Result<Vec<_>>>()?;
-				values.sort_by_key(|(rowid, _)| *rowid);
+						.with_context(|| format!("no matching column for name {:?}", col_name))?
+						.with_context(|| format!("parsing columns for table {:?}", sql_select.table_name))?;
 
-				println!("{}", values.into_iter()
-					.map(|(rowid, val)| val.map(Cow::from)
-						.unwrap_or_else(|| Cow::from(format!("{rowid}"))))
-					.join("\n"))
+					let mut values = parse_records_fields(&table_page)
+						.map(|r| r.and_then(|(record, mut fields)| {
+							Ok(if col.is_rowid_alias {
+								(record.rowid, None)
+							} else {
+								let (typ, val) = fields.nth(col_idx)
+									.with_context(|| format!("expected record field for column {col_idx}"))?
+									.context("parsing record fields")?;
+								assert!(is_text_type(typ), "assuming text columns only (type: {typ})");
+								(record.rowid, Some(std::str::from_utf8(val)
+									.context("reading text value as UTF-8")?))
+							})
+						}))
+						.collect::<anyhow::Result<Vec<_>>>()?;
+					values.sort_by_key(|(rowid, _)| *rowid);
+
+					println!("{}", values.into_iter()
+						.map(|(rowid, val)| val.map(Cow::from)
+							.unwrap_or_else(|| Cow::from(format!("{rowid}"))))
+						.join("\n"))
+				}
 			}
 		}
 		_ => anyhow::bail!("unsupported command {command:?}"),
 	}
 
 	Ok(())
+}
+
+
+enum SqlSelectCount { All }
+
+enum SqlSelectColumn<'a> {
+	Count(SqlSelectCount),
+	Ident(&'a str),
+}
+
+struct SqlSelect<'a> {
+	column: SqlSelectColumn<'a>,
+	table_name: &'a str,
+}
+
+fn parse_sql_select(sql: &str) -> anyhow::Result<SqlSelect<'_>> {
+	let sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+	anyhow::ensure!(sql.len() >= 6 && sql[..6].eq_ignore_ascii_case("select"),
+		"expected `SELECT` token");
+	let sql = sql[6..].strip_prefix(|c: char| c.is_ascii_whitespace())
+		.context("expected ASCII whitespace after `SELECT` token")?;
+
+	let (column, sql) = if let Some((count, sql)) = maybe_parse_sql_select_count(sql)
+		.context("parsing `COUNT(*)` term")? {
+		(SqlSelectColumn::Count(count), sql)
+	} else {
+		let (ident, sql) = parse_sql_ident(sql)
+			.context("parsing column identifier")?;
+		(SqlSelectColumn::Ident(ident), sql)
+	};
+
+	let sql = sql.strip_prefix(|c: char| c.is_ascii_whitespace())
+		.context("expected ASCII whitespace after `<select expression>` token")?;
+	anyhow::ensure!(sql.len() >= 4 && sql[..4].eq_ignore_ascii_case("from"),
+		"expected `FROM` token");
+	let sql = sql[4..].strip_prefix(|c: char| c.is_ascii_whitespace())
+		.context("expected ASCII whitespace after `FROM` token")?;
+	let (table_name, sql) = parse_sql_ident(sql)
+		.context("parsing table identifier")?;
+
+	anyhow::ensure!(sql.trim_start_matches(|c: char| c.is_ascii_whitespace()).is_empty(),
+		"expected end of SQL `SELECT` query");
+
+	Ok(SqlSelect { column, table_name })
+}
+
+fn parse_sql_ident(sql: &str) -> anyhow::Result<(&str, &str)> {
+	anyhow::ensure!(sql.starts_with(|c: char| c.is_ascii_alphabetic()),
+		"expected identifier to start with ASCII alphabetic character");
+	let end = sql.bytes().skip(1)
+		.position(|b| b != b'_' && !char::from(b).is_ascii_alphanumeric())
+		.unwrap_or(sql.len() - 1) + 1;
+	Ok(sql.split_at(end))
+}
+
+fn maybe_parse_sql_select_count(sql: &str) -> anyhow::Result<Option<(SqlSelectCount, &str)>> {
+	if sql.len() < 5 || !sql[..5].eq_ignore_ascii_case("count") { return Ok(None) }
+	let sql = sql[5..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+	let Some(sql) = sql.strip_prefix('(') else { return Ok(None) };
+	let sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+	let sql = sql.strip_prefix('*').context("expected `*` (asterisk)")?;
+	let sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+	let sql = sql.strip_prefix(')').context("expected `)` (right parenthesis)")?;
+	Ok(Some((SqlSelectCount::All, sql)))
 }
 
 
