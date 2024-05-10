@@ -77,9 +77,12 @@ fn main() -> anyhow::Result<()> {
 							} else {
 								let &(typ, val) = fields.get(*col_idx)
 									.context("expected valid column index")?;
-								assert!(is_text_type(typ), "assuming text columns only (type: {typ})");
+								anyhow::ensure!(is_text_type(typ),
+									"expected text type for column {:?}, found type {typ}",
+									col.name);
 								Cow::from(std::str::from_utf8(val)
-									.context("reading text value as UTF-8")?)
+									.with_context(|| format!("expected UTF-8 string for column {:?} value",
+										col.name))?)
 							}))
 							.collect::<anyhow::Result<Vec<_>>>()?;
 						vals.join("|")
