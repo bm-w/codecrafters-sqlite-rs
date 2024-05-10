@@ -20,7 +20,7 @@ edition = "2021"
 # DON'T EDIT THIS!
 [dependencies]
 anyhow = "1.0.59"    # error handling
-itertools = "0.10.3" # useful iterator extensions
+itertools = "0.12.1" # useful iterator extensions
 nom = "7.0.0"        # for parsing
 peg = "0.7.0"        # for parsing
 regex = "1.5.4"      # for parsing

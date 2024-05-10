@@ -1,4 +1,11 @@
-use std::{borrow::Cow, fs::File, io::prelude::*, num::{NonZeroU64, NonZeroUsize}, path::Path};
+use std::{
+	borrow::Cow,
+	fs::File,
+	io::prelude::*,
+	iter::FusedIterator,
+	num::{NonZeroU64, NonZeroUsize},
+	path::Path
+};
 
 use anyhow::Context as _;
 use itertools::Itertools as _;
@@ -25,7 +32,9 @@ fn main() -> anyhow::Result<()> {
 			let (page, _file) = parse_first_page(database_path.as_ref())
 				.context("parsing first page")?;
 
-			let mut schema_records = parse_schema_records(&page)
+			let mut schema_records = page
+				.parse_schema_records()
+				.lift_fallible_iterator()
 				.collect::<anyhow::Result<Vec<_>>>()?;
 			schema_records.sort_by_key(|sr| sr.id);
 
@@ -38,7 +47,9 @@ fn main() -> anyhow::Result<()> {
 				.context("parsing first page")?;
 			let file_header = first_page.file_header.as_ref().expect("first page has file header");
 
-			let schema_record = parse_schema_records(&first_page)
+			let schema_record = first_page
+				.parse_schema_records()
+				.lift_fallible_iterator()
 				.find(|r| !r.as_ref().is_ok_and(|sr| sr.name != sql_select.table_name))
 				.with_context(|| format!("no matching schema record for table {:?}", sql_select.table_name))?
 				.context("parsing schema records")?;
@@ -74,7 +85,9 @@ fn main() -> anyhow::Result<()> {
 					Ok((col_idx, wher))
 				}).transpose()?;
 
-				let mut rows = parse_records_fields(&table_page)
+				let mut rows = table_page
+					.parse_records_fields()
+					.lift_fallible_iterator()
 					.filter_map(|r| r.and_then(|(record, fields)| Ok(Some((record.rowid, {
 						// TODO: Avoid allocating?
 						let fields = fields.collect::<anyhow::Result<Vec<_>>>()?;
@@ -276,11 +289,12 @@ struct SchemaRecord<'a> {
 	sql: Cow<'a, str>,
 }
 
-fn parse_schema_records(first_page: &Page)
--> impl Iterator<Item = anyhow::Result<SchemaRecord<'_>>> {
-	parse_records_fields(first_page).map(|record_fields| {
-		let (record, fields) = record_fields.context("parsing record fields")?;
-		let mut fields = fields.map(|r| r.context("parsing field"));
+impl<'a> TryFrom<(Record<'a>, RecordFields<'a>)> for SchemaRecord<'a> {
+	type Error = anyhow::Error;
+	fn try_from(record_fields: (Record<'a>, RecordFields<'a>)) -> Result<Self, Self::Error> {
+		let (record, fields) = record_fields;
+		let mut fields = fields.enumerate()
+			.map(|(i, r)| r.with_context(|| format!("parsing field {i}")));
 
 		// `type` column
 		let (typ, table_type) = fields.next().context("expected `type` column field")??;
@@ -304,75 +318,158 @@ fn parse_schema_records(first_page: &Page)
 		anyhow::ensure!(is_text_type(typ), "expected text type for `sql` column");
 		let sql = std::str::from_utf8(sql).expect("reading `sql` value as UTF-8");
 
+		fields.for_each(drop); // Should be empty, but just in case
+
 		Ok(SchemaRecord {
 			id: record.rowid,
 			name: name.into(),
 			root_page,
 			sql: sql.into(),
 		})
-	})
+	}
 }
 
-fn parse_records_fields(page: &Page)
--> impl Iterator<Item = anyhow::Result<(
-	Record<'_>,
-	impl Iterator<Item = anyhow::Result<(i64, &[u8])>>
-)>> {
-	parse_records(page).map(|record| {
-		let record = record.context("parsing record")?;
+impl Page {
+	fn parse_schema_records(&self)
+	-> anyhow::Result<impl Iterator<
+		Item = anyhow::Result<SchemaRecord>
+	>> {
+		Ok(self.parse_records_fields()
+			.context("parsing page records’ fields")?
+			.map(|record_fields| SchemaRecord::try_from(record_fields?))
+			.take_while_inclusive(Result::is_ok))
+	}
 
-		let (size, record_header_len) = parse_varint(record.payload)
-			.context("parsing first cell’s payload size `varint`")?;
+	fn parse_records_fields(&self)
+	-> anyhow::Result<impl Iterator<Item = anyhow::Result<(Record, RecordFields)>>> {
+		Ok(self.parse_records()
+			.context("parsing page records")?
+			.enumerate()
+			.map(|(idx, record)| {
+				let record = record
+					.with_context(|| format!("parsing record {idx}"))?;
+				let record_fields = record.parse_fields()
+					.with_context(|| format!("parsing fields for record {idx}"))?;
+				Ok((record, record_fields))
+			})
+			.take_while_inclusive(Result::is_ok))
+	}
+}
+
+struct RecordFields<'a> {
+	record: Record<'a>,
+	record_header_len: usize, // TODO: Move into `Record`?
+	type_offset: usize,
+	val_offset: usize,
+	idx: usize,
+}
+
+impl<'a> RecordFields<'a> {
+	fn next_field(&mut self) -> anyhow::Result<(i64, &'a [u8])> {
+		let (type_size, typ) = parse_varint(&self.record.payload[self.type_offset..])
+			.context("parsing type")?;
+		let val_size = val_len(typ).context("computing value length")?;
+		anyhow::ensure!(self.cell.payload.len() >= self.val_offset + val_size,
+			"expected cell payload length of at least {} bytes, but found {}",
+			self.val_offset + val_size,
+			self.cell.payload.len());
+		let val = &self.record.payload[self.val_offset..self.val_offset + val_size];
+		self.type_offset += type_size;
+		self.val_offset += val_size;
+		Ok((typ, val))
+	}
+}
+
+impl<'a> Iterator for RecordFields<'a> {
+	type Item = anyhow::Result<(i64, &'a [u8])>;
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.type_offset == self.record_header_len { return None }
+		self.idx += 1;
+		let next = self.next_field().with_context(|| format!("parsing field {}", self.idx - 1));
+		if next.is_err() { self.type_offset = self.record_header_len } // Fuse
+		Some(next)
+	}
+}
+
+impl FusedIterator for RecordFields<'_> {}
+
+impl<'a> Record<'a> {
+	fn parse_fields(&self) -> anyhow::Result<RecordFields<'a>> {
+		let (size, record_header_len) = parse_varint(self.payload)
+			.context("parsing `varint` as record header length")?;
 		let record_header_len = record_header_len as usize;
+		anyhow::ensure!(self.payload.len() >= record_header_len,
+			"expected cell payload length of at least {} bytes, but found {}",
+			record_header_len,
+			self.payload.len());
 
-		let mut type_offset = size;
-		let mut val_offset = record_header_len;
-
-		let payload = record.payload;
-
-		Ok((record, std::iter::from_fn(move || {
-			if type_offset == record_header_len { return None }
-
-			fn inner<'a>(payload: &'a [u8], type_offset: &mut usize, val_offset: &mut usize)
-			-> anyhow::Result<(i64, &'a [u8])> {
-				let (size, typ) = parse_varint(&payload[*type_offset..]).context("parsing type")?;
-				*type_offset += size;
-				let size = val_len(typ).context("computing value length")?;
-				let val = &payload[*val_offset..*val_offset + size];
-				*val_offset += size;
-				Ok((typ, val))
-			}
-			Some(inner(payload, &mut type_offset, &mut val_offset))
-		})))
-	})
+		Ok(RecordFields {
+			record: Record { ..*self },
+			record_header_len,
+			type_offset: size,
+			val_offset: record_header_len,
+			idx: 0
+		})
+	}
 }
 
-struct Record<'a> {
-	rowid: NonZeroU64,
-	payload: &'a [u8],
+struct PageRecords<'a> {
+	page: &'a Page,
+	cell_offset: usize,
+	cell_idxs: std::ops::Range<usize>,
 }
 
-fn parse_records(page: &Page) -> impl Iterator<Item = anyhow::Result<Record<'_>>> {
-	let mut cell_offset = page.cells_offset
-		- page.file_header.as_ref().map(|h| h.buf.len()).unwrap_or(0);
-
-	(0..page.num_cells).map(move |_| {
-		let (size, payload_len) = parse_varint(&page.buf[cell_offset..])
+impl<'a> PageRecords<'a> {
+	fn next_record(&mut self) -> anyhow::Result<Record<'a>> {
+		let (size, payload_len) = parse_varint(&self.page.buf[self.cell_offset..])
 			.context("parsing first cell’s payload size `varint`")?;
 		let payload_len = payload_len as usize;
 
-		let rowid_offset = cell_offset + size;
-		let (size, rowid) = parse_varint(&page.buf[rowid_offset..])
+		let rowid_offset = self.cell_offset + size;
+		let (size, rowid) = parse_varint(&self.page.buf[rowid_offset..])
 			.context("parsing first cell’s payload size `varint`")?;
 		let rowid: u64 = rowid.try_into().context("expected non-negative `rowid`")?;
 		let rowid = rowid.try_into().context("expected non-zero `rowid`")?;
 
 		let payload_offset = rowid_offset + size;
 
-		cell_offset = payload_offset + payload_len;
+		self.cell_offset = payload_offset + payload_len;
 
-		Ok(Record { rowid, payload: &page.buf[payload_offset..payload_offset + payload_len] })
-	})
+		let payload = &self.page.buf[payload_offset..payload_offset + payload_len];
+		Ok(Record { rowid, payload })
+	}
+}
+
+impl<'a> Iterator for PageRecords<'a> {
+	type Item = anyhow::Result<Record<'a>>;
+	fn next(&mut self) -> Option<Self::Item> {
+		let cell_idx = self.cell_idxs.next()?;
+		let next = self.next_record()
+			.with_context(|| format!("parsing page record for cell {cell_idx}"));
+		if next.is_err() { self.cell_idxs.by_ref().for_each(drop) } // Fuse
+		Some(next)
+	}
+}
+
+impl FusedIterator for PageRecords<'_> {}
+
+impl Page {
+	fn parse_records(&self) -> anyhow::Result<PageRecords> {
+		let file_header_len = self.file_header.as_ref().map(|h| h.buf.len()).unwrap_or(0);
+		let cell_offset = self.cells_offset - file_header_len;
+
+		anyhow::ensure!(self.buf.len() >= cell_offset,
+			"expected page size of at least {} bytes, but found {}",
+			self.cells_offset,
+			self.buf.len() + file_header_len);
+
+		Ok(PageRecords { page: self, cell_offset, cell_idxs: 0..self.num_cells })
+	}
+}
+
+struct Record<'a> {
+	rowid: NonZeroU64,
+	payload: &'a [u8],
 }
 
 fn int_val(typ: i64, buf: &[u8]) -> anyhow::Result<(usize, Option<i64>)> {
@@ -495,10 +592,30 @@ fn parse_header(database_path: &Path) -> anyhow::Result<(Header, File)> {
 	let page_size = u16::from_be_bytes(buf[16..18].try_into().unwrap()) as usize;
 	let num_pages = u32::from_be_bytes(buf[28..32].try_into().unwrap()) as usize;
 	anyhow::ensure!(file_size == num_pages * page_size,
-		"expected file size of {} but found {file_size}", num_pages * page_size);
+		"expected file size of {} bytes, but found {file_size}", num_pages * page_size);
 
 	let freelist_page = u32::from_be_bytes(buf[32..36].try_into().unwrap());
 	anyhow::ensure!(freelist_page == 0, "expected no freelist page");
 
 	Ok((Header { page_size, _num_pages: num_pages, buf }, file))
+}
+
+
+// - Utilities
+
+// TODO: Better name?
+trait LiftFallibleIteratorExt {
+	type IteratorItem;
+	fn lift_fallible_iterator(self) -> impl Iterator<Item = Self::IteratorItem>;
+}
+
+impl<I, T, E> LiftFallibleIteratorExt for Result<I, E>
+where I: Iterator<Item = Result<T, E>> {
+	type IteratorItem = Result<T, E>;
+	fn lift_fallible_iterator(self) -> impl Iterator<Item = Self::IteratorItem> {
+		match self {
+			Ok(it) => itertools::Either::Left(it),
+			Err(err) => itertools::Either::Right(std::iter::once(Err(err))),
+		}
+	}
 }
