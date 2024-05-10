@@ -46,41 +46,50 @@ fn main() -> anyhow::Result<()> {
 			let table_page = parse_page(&mut file, file_header, schema_record.root_page)
 				.with_context(|| format!("parsing page {}", schema_record.root_page))?;
 
-			match sql_select.column {
-				SqlSelectColumn::Count(SqlSelectCount::All) =>
-					println!("{}", table_page.num_cells),
-				SqlSelectColumn::Ident(col_name) => {
-					let (col_idx, col) = parse_sql_create(sql_select.table_name, &schema_record.sql)
-						.with_context(|| format!("parsing SQL create statement for table {:?}", sql_select.table_name))?
-						.enumerate()
-						.find_map(|(i, r)| match r {
-							Ok(col) => (col.name == col_name).then_some(Ok((i, col))),
-							Err(err) => Some(Err(err)),
-						})
-						.with_context(|| format!("no matching column for name {:?}", col_name))?
-						.with_context(|| format!("parsing columns for table {:?}", sql_select.table_name))?;
+			if sql_select.columns.len() == 1
+				&& matches!(sql_select.columns[0], SqlSelectColumn::Count(SqlSelectCount::All)) {
+				println!("{}", table_page.num_cells);
+			} else {
+				let sql_create_cols = parse_sql_create(sql_select.table_name, &schema_record.sql)
+					.with_context(|| format!("parsing SQL create statement for table {:?}", sql_select.table_name))?
+					.collect::<anyhow::Result<Vec<_>>>()
+					.with_context(|| format!("parsing columns for table {:?}", sql_select.table_name))?;
 
-					let mut values = parse_records_fields(&table_page)
-						.map(|r| r.and_then(|(record, mut fields)| {
-							Ok(if col.is_rowid_alias {
-								(record.rowid, None)
+				let indexed_cols = sql_select.columns.iter()
+					.map(|sel_col| match sel_col {
+						&SqlSelectColumn::Ident(col_name) =>
+							sql_create_cols.iter()
+								.enumerate()
+								.find(|(_, c)| c.name == col_name)
+								.with_context(|| format!("no matching column for name {col_name}")),
+						_ => anyhow::bail!("expected column name"),
+					})
+					.collect::<anyhow::Result<Vec<_>>>()
+					.context("finding `SELECT` column indices")?;
+
+				let mut rows = parse_records_fields(&table_page)
+					.map(|r| r.and_then(|(record, fields)| Ok((record.rowid, {
+						// TODO: Avoid allocating?
+						let fields = fields.collect::<anyhow::Result<Vec<_>>>()?;
+						let vals = indexed_cols.iter()
+							.map(|(col_idx, col)| Ok(if col.is_rowid_alias {
+								Cow::from(format!("{}", record.rowid))
 							} else {
-								let (typ, val) = fields.nth(col_idx)
-									.with_context(|| format!("expected record field for column {col_idx}"))?
-									.context("parsing record fields")?;
+								let &(typ, val) = fields.get(*col_idx)
+									.context("expected valid column index")?;
 								assert!(is_text_type(typ), "assuming text columns only (type: {typ})");
-								(record.rowid, Some(std::str::from_utf8(val)
-									.context("reading text value as UTF-8")?))
-							})
-						}))
-						.collect::<anyhow::Result<Vec<_>>>()?;
-					values.sort_by_key(|(rowid, _)| *rowid);
+								Cow::from(std::str::from_utf8(val)
+									.context("reading text value as UTF-8")?)
+							}))
+							.collect::<anyhow::Result<Vec<_>>>()?;
+						vals.join("|")
+					}))))
+					.collect::<anyhow::Result<Vec<_>>>()?;
+				rows.sort_by_key(|(rowid, _)| *rowid);
 
-					println!("{}", values.into_iter()
-						.map(|(rowid, val)| val.map(Cow::from)
-							.unwrap_or_else(|| Cow::from(format!("{rowid}"))))
-						.join("\n"))
-				}
+				println!("{}", rows.into_iter()
+					.map(|(_, val)| val)
+					.join("\n"))
 			}
 		}
 		_ => anyhow::bail!("unsupported command {command:?}"),
@@ -98,7 +107,7 @@ enum SqlSelectColumn<'a> {
 }
 
 struct SqlSelect<'a> {
-	column: SqlSelectColumn<'a>,
+	columns: Vec<SqlSelectColumn<'a>>,
 	table_name: &'a str,
 }
 
@@ -109,13 +118,25 @@ fn parse_sql_select(sql: &str) -> anyhow::Result<SqlSelect<'_>> {
 	let sql = sql[6..].strip_prefix(|c: char| c.is_ascii_whitespace())
 		.context("expected ASCII whitespace after `SELECT` token")?;
 
-	let (column, sql) = if let Some((count, sql)) = maybe_parse_sql_select_count(sql)
-		.context("parsing `COUNT(*)` term")? {
-		(SqlSelectColumn::Count(count), sql)
-	} else {
-		let (ident, sql) = parse_sql_ident(sql)
-			.context("parsing column identifier")?;
-		(SqlSelectColumn::Ident(ident), sql)
+	let (columns, sql) = {
+		let mut acc = Vec::new();
+		let mut sql = sql;
+		loop {
+			if let Some((count, sql_rest)) = maybe_parse_sql_select_count(sql)
+				.context("parsing `COUNT(*)` term")? {
+				acc.push(SqlSelectColumn::Count(count));
+				sql = sql_rest;
+			} else {
+				let (ident, sql_rest) = parse_sql_ident(sql)
+					.context("parsing column identifier")?;
+				acc.push(SqlSelectColumn::Ident(ident));
+				sql = sql_rest;
+			}
+			let end_sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+			if !end_sql.starts_with(',') { break }
+			sql = &end_sql[1..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+		}
+		(acc, sql)
 	};
 
 	let sql = sql.strip_prefix(|c: char| c.is_ascii_whitespace())
@@ -130,7 +151,7 @@ fn parse_sql_select(sql: &str) -> anyhow::Result<SqlSelect<'_>> {
 	anyhow::ensure!(sql.trim_start_matches(|c: char| c.is_ascii_whitespace()).is_empty(),
 		"expected end of SQL `SELECT` query");
 
-	Ok(SqlSelect { column, table_name })
+	Ok(SqlSelect { columns, table_name })
 }
 
 fn parse_sql_ident(sql: &str) -> anyhow::Result<(&str, &str)> {
