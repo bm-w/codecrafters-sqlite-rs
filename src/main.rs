@@ -67,10 +67,35 @@ fn main() -> anyhow::Result<()> {
 					.collect::<anyhow::Result<Vec<_>>>()
 					.context("finding `SELECT` column indices")?;
 
+				let indexed_where_col = sql_select.wher.as_ref().map(|wher| -> anyhow::Result<_> {
+					let col_idx = sql_create_cols.iter()
+						.position(|col| col.name == wher.left_col_name)
+						.with_context(|| format!("no matching column for name {}", wher.left_col_name))?;
+					Ok((col_idx, wher))
+				}).transpose()?;
+
 				let mut rows = parse_records_fields(&table_page)
-					.map(|r| r.and_then(|(record, fields)| Ok((record.rowid, {
+					.filter_map(|r| r.and_then(|(record, fields)| Ok(Some((record.rowid, {
 						// TODO: Avoid allocating?
 						let fields = fields.collect::<anyhow::Result<Vec<_>>>()?;
+
+						if let Some((
+							col_idx,
+							&SqlWhere { op: SqlWhereOp::Eq, left_col_name, right_str_operand }
+						)) = indexed_where_col {
+							let &(typ, val) = fields.get(col_idx)
+								.context("expected valid column index")?;
+							anyhow::ensure!(is_text_type(typ),
+								"expected text type for column {:?}, found type {typ}",
+								left_col_name);
+							let val = std::str::from_utf8(val)
+								.with_context(|| format!("expected UTF-8 string for column {:?} value",
+									left_col_name))?;
+							if val != right_str_operand {
+								return Ok(None);
+							}
+						}
+
 						let vals = indexed_cols.iter()
 							.map(|(col_idx, col)| Ok(if col.is_rowid_alias {
 								Cow::from(format!("{}", record.rowid))
@@ -86,7 +111,7 @@ fn main() -> anyhow::Result<()> {
 							}))
 							.collect::<anyhow::Result<Vec<_>>>()?;
 						vals.join("|")
-					}))))
+					})))).transpose())
 					.collect::<anyhow::Result<Vec<_>>>()?;
 				rows.sort_by_key(|(rowid, _)| *rowid);
 
@@ -102,6 +127,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 
+enum SqlWhereOp { Eq }
+
+struct SqlWhere<'a> {
+	op: SqlWhereOp,
+	left_col_name: &'a str,
+	right_str_operand: &'a str,
+}
+
 enum SqlSelectCount { All }
 
 enum SqlSelectColumn<'a> {
@@ -112,6 +145,7 @@ enum SqlSelectColumn<'a> {
 struct SqlSelect<'a> {
 	columns: Vec<SqlSelectColumn<'a>>,
 	table_name: &'a str,
+	wher: Option<SqlWhere<'a>>,
 }
 
 fn parse_sql_select(sql: &str) -> anyhow::Result<SqlSelect<'_>> {
@@ -151,10 +185,27 @@ fn parse_sql_select(sql: &str) -> anyhow::Result<SqlSelect<'_>> {
 	let (table_name, sql) = parse_sql_ident(sql)
 		.context("parsing table identifier")?;
 
+	let sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+	let (wher, sql) = if sql.len() >= 5 && sql[..5].eq_ignore_ascii_case("where") {
+		let sql = sql[5..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+		let (left_col_name, sql) = parse_sql_ident(sql)
+			.context("parsing where left column identifier")?;
+		let sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+		let sql = sql.strip_prefix('=').context("expected `=` token (only supported operator)")?;
+		let sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+		let sql = sql.strip_prefix('\'').context("expected `'` token (only string operands supported)")?;
+		// TODO: Consider escaped quotes "\'"
+		let (right_str_operand, sql) = sql.split_once('\'').context("expected closing '\'' token")?;
+		(Some(SqlWhere { op: SqlWhereOp::Eq, left_col_name, right_str_operand }), sql)
+	} else {
+		(None, sql)
+	};
+
 	anyhow::ensure!(sql.trim_start_matches(|c: char| c.is_ascii_whitespace()).is_empty(),
 		"expected end of SQL `SELECT` query");
 
-	Ok(SqlSelect { columns, table_name })
+	Ok(SqlSelect { columns, table_name, wher })
 }
 
 fn parse_sql_ident(sql: &str) -> anyhow::Result<(&str, &str)> {
