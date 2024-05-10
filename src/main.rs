@@ -143,7 +143,7 @@ enum SqlSelectColumn<'a> {
 }
 
 struct SqlSelect<'a> {
-	columns: Vec<SqlSelectColumn<'a>>,
+	columns: Box<[SqlSelectColumn<'a>]>,
 	table_name: &'a str,
 	wher: Option<SqlWhere<'a>>,
 }
@@ -173,7 +173,7 @@ fn parse_sql_select(sql: &str) -> anyhow::Result<SqlSelect<'_>> {
 			if !end_sql.starts_with(',') { break }
 			sql = &end_sql[1..].trim_start_matches(|c: char| c.is_ascii_whitespace());
 		}
-		(acc, sql)
+		(acc.into(), sql)
 	};
 
 	let sql = sql.strip_prefix(|c: char| c.is_ascii_whitespace())
@@ -441,7 +441,7 @@ struct Page {
 	file_header: Option<Header>,
 	num_cells: usize,
 	cells_offset: usize,
-	buf: Vec<u8>,
+	buf: Box<[u8]>,
 }
 
 fn parse_first_page(database_path: &Path) -> anyhow::Result<(Page, File)> {
@@ -462,7 +462,7 @@ fn parse_page(file: &mut File, file_header: &Header, num: NonZeroU64) -> anyhow:
 	file.seek(std::io::SeekFrom::Start(page_byte_offset as u64))
 		.with_context(|| format!("seeking to file offset {page_byte_offset} for page {num}"))?;
 
-	let mut buf = vec![0u8; file_header.page_size - file_header_len];
+	let mut buf = vec![0u8; file_header.page_size - file_header_len].into_boxed_slice();
 	file.read_exact(&mut buf)
 		.with_context(|| format!("reading page {num} from file offset {page_byte_offset}"))?;
 
