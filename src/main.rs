@@ -88,7 +88,7 @@ fn main() -> anyhow::Result<()> {
 				let mut rows = table_page
 					.parse_records_fields()
 					.lift_fallible_iterator()
-					.filter_map(|r| r.and_then(|(record, fields)| Ok(Some((record.rowid, {
+					.filter_map(|r| r.and_then(|(cell, fields)| Ok(Some((cell.rowid, {
 						// TODO: Avoid allocating?
 						let fields = fields.collect::<anyhow::Result<Vec<_>>>()?;
 
@@ -111,7 +111,7 @@ fn main() -> anyhow::Result<()> {
 
 						let vals = indexed_cols.iter()
 							.map(|(col_idx, col)| Ok(if col.is_rowid_alias {
-								Cow::from(format!("{}", record.rowid))
+								Cow::from(format!("{}", cell.rowid))
 							} else {
 								let &(typ, val) = fields.get(*col_idx)
 									.context("expected valid column index")?;
@@ -289,10 +289,10 @@ struct SchemaRecord<'a> {
 	sql: Cow<'a, str>,
 }
 
-impl<'a> TryFrom<(Record<'a>, RecordFields<'a>)> for SchemaRecord<'a> {
+impl<'a> TryFrom<(Cell<'a>, RecordFields<'a>)> for SchemaRecord<'a> {
 	type Error = anyhow::Error;
-	fn try_from(record_fields: (Record<'a>, RecordFields<'a>)) -> Result<Self, Self::Error> {
-		let (record, fields) = record_fields;
+	fn try_from(cell_record_fields: (Cell<'a>, RecordFields<'a>)) -> Result<Self, Self::Error> {
+		let (cell, fields) = cell_record_fields;
 		let mut fields = fields.enumerate()
 			.map(|(i, r)| r.with_context(|| format!("parsing field {i}")));
 
@@ -321,7 +321,7 @@ impl<'a> TryFrom<(Record<'a>, RecordFields<'a>)> for SchemaRecord<'a> {
 		fields.for_each(drop); // Should be empty, but just in case
 
 		Ok(SchemaRecord {
-			id: record.rowid,
+			id: cell.rowid,
 			name: name.into(),
 			root_page,
 			sql: sql.into(),
@@ -336,29 +336,29 @@ impl Page {
 	>> {
 		Ok(self.parse_records_fields()
 			.context("parsing page records’ fields")?
-			.map(|record_fields| SchemaRecord::try_from(record_fields?))
+			.map(|cell_record_fields| SchemaRecord::try_from(cell_record_fields?))
 			.take_while_inclusive(Result::is_ok))
 	}
 
 	fn parse_records_fields(&self)
-	-> anyhow::Result<impl Iterator<Item = anyhow::Result<(Record, RecordFields)>>> {
-		Ok(self.parse_records()
+	-> anyhow::Result<impl Iterator<Item = anyhow::Result<(Cell, RecordFields)>>> {
+		Ok(self.parse_cells()
 			.context("parsing page records")?
 			.enumerate()
-			.map(|(idx, record)| {
-				let record = record
-					.with_context(|| format!("parsing record {idx}"))?;
-				let record_fields = record.parse_fields()
-					.with_context(|| format!("parsing fields for record {idx}"))?;
-				Ok((record, record_fields))
+			.map(|(idx, cell)| {
+				let cell = cell
+					.with_context(|| format!("parsing cell {idx}"))?;
+				let record_fields = cell.parse_record_fields()
+					.with_context(|| format!("parsing record fields for cell {idx}"))?;
+				Ok((cell, record_fields))
 			})
 			.take_while_inclusive(Result::is_ok))
 	}
 }
 
 struct RecordFields<'a> {
-	record: Record<'a>,
-	record_header_len: usize, // TODO: Move into `Record`?
+	cell: Cell<'a>,
+	record_header_len: usize,
 	type_offset: usize,
 	val_offset: usize,
 	idx: usize,
@@ -366,14 +366,14 @@ struct RecordFields<'a> {
 
 impl<'a> RecordFields<'a> {
 	fn next_field(&mut self) -> anyhow::Result<(i64, &'a [u8])> {
-		let (type_size, typ) = parse_varint(&self.record.payload[self.type_offset..])
+		let (type_size, typ) = parse_varint(&self.cell.payload[self.type_offset..])
 			.context("parsing type")?;
 		let val_size = val_len(typ).context("computing value length")?;
 		anyhow::ensure!(self.cell.payload.len() >= self.val_offset + val_size,
 			"expected cell payload length of at least {} bytes, but found {}",
 			self.val_offset + val_size,
 			self.cell.payload.len());
-		let val = &self.record.payload[self.val_offset..self.val_offset + val_size];
+		let val = &self.cell.payload[self.val_offset..self.val_offset + val_size];
 		self.type_offset += type_size;
 		self.val_offset += val_size;
 		Ok((typ, val))
@@ -393,8 +393,8 @@ impl<'a> Iterator for RecordFields<'a> {
 
 impl FusedIterator for RecordFields<'_> {}
 
-impl<'a> Record<'a> {
-	fn parse_fields(&self) -> anyhow::Result<RecordFields<'a>> {
+impl<'a> Cell<'a> {
+	fn parse_record_fields(&self) -> anyhow::Result<RecordFields<'a>> {
 		let (size, record_header_len) = parse_varint(self.payload)
 			.context("parsing `varint` as record header length")?;
 		let record_header_len = record_header_len as usize;
@@ -404,7 +404,7 @@ impl<'a> Record<'a> {
 			self.payload.len());
 
 		Ok(RecordFields {
-			record: Record { ..*self },
+			cell: Cell { ..*self },
 			record_header_len,
 			type_offset: size,
 			val_offset: record_header_len,
@@ -413,14 +413,14 @@ impl<'a> Record<'a> {
 	}
 }
 
-struct PageRecords<'a> {
+struct PageCells<'a> {
 	page: &'a Page,
 	cell_offset: usize,
 	cell_idxs: std::ops::Range<usize>,
 }
 
-impl<'a> PageRecords<'a> {
-	fn next_record(&mut self) -> anyhow::Result<Record<'a>> {
+impl<'a> PageCells<'a> {
+	fn next_cell(&mut self) -> anyhow::Result<Cell<'a>> {
 		let (size, payload_len) = parse_varint(&self.page.buf[self.cell_offset..])
 			.context("parsing first cell’s payload size `varint`")?;
 		let payload_len = payload_len as usize;
@@ -436,25 +436,25 @@ impl<'a> PageRecords<'a> {
 		self.cell_offset = payload_offset + payload_len;
 
 		let payload = &self.page.buf[payload_offset..payload_offset + payload_len];
-		Ok(Record { rowid, payload })
+		Ok(Cell { rowid, payload })
 	}
 }
 
-impl<'a> Iterator for PageRecords<'a> {
-	type Item = anyhow::Result<Record<'a>>;
+impl<'a> Iterator for PageCells<'a> {
+	type Item = anyhow::Result<Cell<'a>>;
 	fn next(&mut self) -> Option<Self::Item> {
 		let cell_idx = self.cell_idxs.next()?;
-		let next = self.next_record()
-			.with_context(|| format!("parsing page record for cell {cell_idx}"));
+		let next = self.next_cell()
+			.with_context(|| format!("parsing page cell {cell_idx}"));
 		if next.is_err() { self.cell_idxs.by_ref().for_each(drop) } // Fuse
 		Some(next)
 	}
 }
 
-impl FusedIterator for PageRecords<'_> {}
+impl FusedIterator for PageCells<'_> {}
 
 impl Page {
-	fn parse_records(&self) -> anyhow::Result<PageRecords> {
+	fn parse_cells(&self) -> anyhow::Result<PageCells> {
 		let file_header_len = self.file_header.as_ref().map(|h| h.buf.len()).unwrap_or(0);
 		let cell_offset = self.cells_offset - file_header_len;
 
@@ -463,11 +463,11 @@ impl Page {
 			self.cells_offset,
 			self.buf.len() + file_header_len);
 
-		Ok(PageRecords { page: self, cell_offset, cell_idxs: 0..self.num_cells })
+		Ok(PageCells { page: self, cell_offset, cell_idxs: 0..self.num_cells })
 	}
 }
 
-struct Record<'a> {
+struct Cell<'a> {
 	rowid: NonZeroU64,
 	payload: &'a [u8],
 }
