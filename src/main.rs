@@ -3,7 +3,7 @@ use std::{
 	fs::File,
 	io::prelude::*,
 	iter::FusedIterator,
-	num::{NonZeroU64, NonZeroUsize},
+	num::NonZeroU64,
 	path::Path
 };
 
@@ -55,7 +55,7 @@ fn main() -> anyhow::Result<()> {
 				.context("parsing schema records")?;
 
 			let table_page = parse_page(&mut file, file_header, schema_record.root_page)
-				.with_context(|| format!("parsing page {}", schema_record.root_page))?;
+				.with_context(|| format!("parsing page #{}", schema_record.root_page))?;
 
 			if sql_select.columns.len() == 1
 				&& matches!(sql_select.columns[0], SqlSelectColumn::Count(SqlSelectCount::All)) {
@@ -85,12 +85,10 @@ fn main() -> anyhow::Result<()> {
 					Ok((col_idx, wher))
 				}).transpose()?;
 
-				let mut rows = table_page
-					.parse_records_fields()
-					.lift_fallible_iterator()
-					.filter_map(|r| r.and_then(|(cell, fields)| Ok(Some((cell.rowid, {
+				let rows = table_page
+					.scan_records_fields(&mut file, file_header, |cell, record_fields| {
 						// TODO: Avoid allocating?
-						let fields = fields.collect::<anyhow::Result<Vec<_>>>()?;
+						let fields = record_fields.collect::<anyhow::Result<Vec<_>>>()?;
 
 						if let Some((
 							col_idx,
@@ -123,14 +121,15 @@ fn main() -> anyhow::Result<()> {
 										col.name))?)
 							}))
 							.collect::<anyhow::Result<Vec<_>>>()?;
-						vals.join("|")
-					})))).transpose())
-					.collect::<anyhow::Result<Vec<_>>>()?;
-				rows.sort_by_key(|(rowid, _)| *rowid);
+						Ok(Some(vals.join("|")))
+					})
+					.lift_fallible_iterator();
 
-				println!("{}", rows.into_iter()
-					.map(|(_, val)| val)
-					.join("\n"))
+				for (idx, row) in rows.enumerate() {
+					if let Some(row) = row.with_context(|| format!("reading row {idx}"))? {
+						println!("{row}");
+					}
+				}
 			}
 		}
 		_ => anyhow::bail!("unsupported command {command:?}"),
@@ -139,6 +138,8 @@ fn main() -> anyhow::Result<()> {
 	Ok(())
 }
 
+
+// SQL
 
 enum SqlWhereOp { Eq }
 
@@ -257,7 +258,9 @@ fn parse_sql_create<'a>(table_name: &'a str, mut sql: &'a str)
 	anyhow::ensure!(sql.len() >= 5 && sql[..5].eq_ignore_ascii_case("table"),
 		"expected `TABLE` token");
 	sql = sql[5..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+	let (is_quoted, mut sql) = sql.strip_prefix('"').map(|sql| (true, sql)).unwrap_or((false, sql));
 	sql = sql.strip_prefix(table_name).context("expected table name token")?;
+	if is_quoted { sql = sql.strip_prefix('"').context("expected closing quotation mark '\"'")? }
 	sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
 	sql = sql.strip_prefix('(').context("expected '(' (left parenthesis) token")?;
 	sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
@@ -280,6 +283,112 @@ fn parse_sql_create<'a>(table_name: &'a str, mut sql: &'a str)
 	}))
 }
 
+
+// Records
+
+struct ScanRecords<'a, F> {
+	file: &'a mut File,
+	file_header: &'a Header,
+	root_page: &'a Page,
+	root_state: PageCellsState,
+	stack: Vec<(Page, PageCellsState)>,
+	transform: F,
+	failed: bool, // Fuse
+}
+
+impl<F, T> Iterator for ScanRecords<'_, F> where F: Fn(Cell) -> anyhow::Result<T> {
+	type Item = anyhow::Result<T>;
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.failed { return None }
+		let (page, state) = self.stack.last_mut()
+			.map(|(ref page, state)| (page, state))
+			.unwrap_or((self.root_page, &mut self.root_state));
+		let (err, kind) = match (PageCellsState::next(state, page), &page.kind) {
+			(Some((cell_index, Ok(cell))), PageKind::LeafTable) => {
+				let rowid = cell.rowid;
+				match (self.transform)(cell)
+					.with_context(|| format!("processing row cell {cell_index} \
+						with `rowid` {rowid}"))
+				{
+					Ok(result) => return Some(Ok(result)),
+					Err(err) => {
+						self.failed = true;
+						(err, "leaf")
+					}
+				}
+			}
+			(Some((cell_idx, Ok(cell))), PageKind::InteriorTable { .. }) => {
+				let num = cell.left_page
+					.expect("interior pages must have left child pointer page numbers");
+				match parse_page(self.file, self.file_header, num)
+					.with_context(|| format!("parsing page #{num}"))
+					.and_then(|page| match page.parse_cells() {
+						Ok(PageCells { state, ..}) => Ok((page, state)),
+						Err(err) => Err(err)
+							.with_context(|| format!("parsing records for page #{}", page.num))
+					})
+					.with_context(|| format!("parsing child page pointed \
+						to by cell {cell_idx} with `rowid` {}", cell.rowid))
+				{
+					Ok((page, state)) => {
+						self.stack.push((page, state));
+						return self.next()
+					}
+					Err(err) => {
+						self.failed = true;
+						(err, "interior")
+					}
+				}
+			}
+			(Some((_, Err(err))), PageKind::LeafTable) => (err, "leaf"),
+			(Some((_, Err(err))), PageKind::InteriorTable { .. }) => (err, "interior"),
+			(None, _) => return self.stack.pop().and_then(|_| self.next())
+		};
+
+		Some(Err(err).with_context(|| format!("parsing {kind} page #{}", page.num)))
+	}
+}
+
+impl<F, T> FusedIterator for ScanRecords<'_, F> where F: Fn(Cell) -> anyhow::Result<T> {}
+
+
+impl Page {
+	fn scan_records_fields<'a, T, F>(
+		&'a self,
+		file: &'a mut File,
+		file_header: &'a Header,
+		transform: F,
+	) -> anyhow::Result<impl Iterator<Item = anyhow::Result<T>> + 'a>
+	where F: Fn(Cell, RecordFields) -> anyhow::Result<T> + 'a {
+		self.scan_records(file, file_header, move |cell| {
+			let fields = cell.parse_record_fields().with_context(|| format!("parsing fields \
+				for record cell with rowid {}", cell.rowid))?;
+			transform(cell, fields)
+		})
+	}
+
+	fn scan_records<'a, T, F>(
+		&'a self,
+		file: &'a mut File,
+		file_header: &'a Header,
+		transform: F,
+	) -> anyhow::Result<ScanRecords<'a, F>>
+	where F: Fn(Cell) -> anyhow::Result<T> {
+		let PageCells { state, .. } = self.parse_cells()
+			.with_context(|| format!("parsing cells for page #{}", self.num))?;
+
+		Ok(ScanRecords {
+			file,
+			file_header,
+			root_page: self,
+			root_state: state,
+			stack: Vec::new(),
+			transform,
+			failed: false,
+		})
+	}
+}
+
 #[allow(dead_code)]
 struct SchemaRecord<'a> {
 	id: NonZeroU64,
@@ -291,10 +400,8 @@ struct SchemaRecord<'a> {
 
 impl<'a> TryFrom<(Cell<'a>, RecordFields<'a>)> for SchemaRecord<'a> {
 	type Error = anyhow::Error;
-	fn try_from(cell_record_fields: (Cell<'a>, RecordFields<'a>)) -> Result<Self, Self::Error> {
-		let (cell, fields) = cell_record_fields;
-		let mut fields = fields.enumerate()
-			.map(|(i, r)| r.with_context(|| format!("parsing field {i}")));
+	fn try_from(record_fields: (Cell<'a>, RecordFields<'a>)) -> Result<Self, Self::Error> {
+		let (cell, mut fields) = record_fields;
 
 		// `type` column
 		let (typ, table_type) = fields.next().context("expected `type` column field")??;
@@ -395,6 +502,7 @@ impl FusedIterator for RecordFields<'_> {}
 
 impl<'a> Cell<'a> {
 	fn parse_record_fields(&self) -> anyhow::Result<RecordFields<'a>> {
+		anyhow::ensure!(self.left_page.is_none(), "expected record cell");
 		let (size, record_header_len) = parse_varint(self.payload)
 			.context("parsing `varint` as record header length")?;
 		let record_header_len = record_header_len as usize;
@@ -413,41 +521,68 @@ impl<'a> Cell<'a> {
 	}
 }
 
-struct PageCells<'a> {
-	page: &'a Page,
-	cell_offset: usize,
-	cell_idxs: std::ops::Range<usize>,
+
+// Cells
+
+struct PageCellsState {
+	byte_offset: usize,
+	idxs: std::ops::Range<usize>,
 }
 
-impl<'a> PageCells<'a> {
-	fn next_cell(&mut self) -> anyhow::Result<Cell<'a>> {
-		let (size, payload_len) = parse_varint(&self.page.buf[self.cell_offset..])
-			.context("parsing first cell’s payload size `varint`")?;
-		let payload_len = payload_len as usize;
+struct PageCells<'a> {
+	page: &'a Page,
+	state: PageCellsState
+}
 
-		let rowid_offset = self.cell_offset + size;
-		let (size, rowid) = parse_varint(&self.page.buf[rowid_offset..])
-			.context("parsing first cell’s payload size `varint`")?;
-		let rowid: u64 = rowid.try_into().context("expected non-negative `rowid`")?;
-		let rowid = rowid.try_into().context("expected non-zero `rowid`")?;
+impl PageCellsState {
+	fn next<'a>(&mut self, page: &'a Page) -> Option<(usize, anyhow::Result<Cell<'a>>)> {
+		fn inner<'a>(state: &mut PageCellsState, page: &'a Page) -> anyhow::Result<Cell<'a>> {
+			let (rowid_offset, left_page, payload_len) = match page.kind {
+				PageKind::InteriorTable { .. } => {
+					anyhow::ensure!(page.buf.len() >= state.byte_offset + 4,
+						"expected page length of at least {} bytes, but found {}",
+						state.byte_offset + 4,
+						page.buf.len());
+					let left_page = u32::from_be_bytes(
+						page.buf[state.byte_offset..state.byte_offset + 4].try_into()
+							.unwrap()) as u64;
+					let left_page = left_page.try_into()
+						.context("expected non-zero left page number")?;
+					(state.byte_offset + 4, Some(left_page), 0)
+				}
+				PageKind::LeafTable => {
+					let (size, payload_len) = parse_varint(&page.buf[state.byte_offset..])
+						.context("parsing first cell’s payload size `varint`")?;
+					let payload_len = payload_len as usize;
+					(state.byte_offset + size, None, payload_len)
+				}
+			};
 
-		let payload_offset = rowid_offset + size;
+			let (size, rowid) = parse_varint(&page.buf[rowid_offset..])
+				.context("parsing cell’s rowid `varint`")?;
+			let rowid: u64 = rowid.try_into().context("expected non-negative `rowid`")?;
+			let rowid = rowid.try_into().context("expected non-zero `rowid`")?;
 
-		self.cell_offset = payload_offset + payload_len;
+			let payload_offset = rowid_offset + size;
 
-		let payload = &self.page.buf[payload_offset..payload_offset + payload_len];
-		Ok(Cell { rowid, payload })
+			state.byte_offset = payload_offset + payload_len;
+
+			let payload = &page.buf[payload_offset..payload_offset + payload_len];
+			Ok(Cell { left_page, rowid, payload })
+		}
+
+		let cell_idx = self.idxs.next()?;
+		let next = inner(self, page)
+			.with_context(|| format!("parsing page #{} cell {cell_idx}", page.num));
+		if next.is_err() { self.idxs.by_ref().for_each(drop) } // Fuse
+		Some((cell_idx, next))
 	}
 }
 
 impl<'a> Iterator for PageCells<'a> {
 	type Item = anyhow::Result<Cell<'a>>;
 	fn next(&mut self) -> Option<Self::Item> {
-		let cell_idx = self.cell_idxs.next()?;
-		let next = self.next_cell()
-			.with_context(|| format!("parsing page cell {cell_idx}"));
-		if next.is_err() { self.cell_idxs.by_ref().for_each(drop) } // Fuse
-		Some(next)
+		self.state.next(self.page).map(|(_, next)| next)
 	}
 }
 
@@ -463,14 +598,19 @@ impl Page {
 			self.cells_offset,
 			self.buf.len() + file_header_len);
 
-		Ok(PageCells { page: self, cell_offset, cell_idxs: 0..self.num_cells })
+		let state = PageCellsState { byte_offset: cell_offset, idxs: 0..self.num_cells };
+		Ok(PageCells { page: self, state })
 	}
 }
 
 struct Cell<'a> {
+	left_page: Option<NonZeroU64>,
 	rowid: NonZeroU64,
 	payload: &'a [u8],
 }
+
+
+// Types & values
 
 fn int_val(typ: i64, buf: &[u8]) -> anyhow::Result<(usize, Option<i64>)> {
 	fn try_arr<const LEN: usize>(buf: &[u8]) -> anyhow::Result<[u8; LEN]> {
@@ -500,7 +640,7 @@ fn val_len(typ: i64) -> anyhow::Result<usize> {
 		0..=4 => typ as usize,
 		5 => 6,
 		6 | 7 => 8,
-		8 | 9 => 9,
+		8 | 9 => 0,
 		10 | 11 => anyhow::bail!("unexpected internal type"),
 		_blob_typ if typ >= 12 && typ % 2 == 0 => (typ as usize - 12) / 2,
 		text_typ if is_text_type(text_typ) => (typ as usize - 13) / 2,
@@ -534,8 +674,18 @@ fn parse_varint(buf: &[u8]) -> anyhow::Result<(usize, i64)> {
 	Ok((offset + 1, unsafe { std::mem::transmute(bits) }))
 }
 
+
+// Pages
+
+enum PageKind {
+	LeafTable,
+	InteriorTable { _rightmost_page: u64 },
+}
+
 struct Page {
+	num: NonZeroU64,
 	file_header: Option<Header>,
+	kind: PageKind,
 	num_cells: usize,
 	cells_offset: usize,
 	buf: Box<[u8]>,
@@ -546,6 +696,9 @@ fn parse_first_page(database_path: &Path) -> anyhow::Result<(Page, File)> {
 	let mut page = parse_page(&mut file, &file_header, unsafe { NonZeroU64::new_unchecked(1) })?;
 	page.file_header = Some(file_header);
 
+	anyhow::ensure!(matches!(page.kind, PageKind::LeafTable),
+		"expected first page to be leaf-table");
+
 	Ok((page, file))
 }
 
@@ -553,21 +706,44 @@ fn parse_page(file: &mut File, file_header: &Header, num: NonZeroU64) -> anyhow:
 	let is_first_page = num.get() == 1; // Page numbers are 1-indexed
 	let file_header_len = if is_first_page { file_header.buf.len() } else { 0 };
 
-	let num: NonZeroUsize = num.try_into()
-		.expect("`u64` should fit in `usize` (assuming 64-bit arch)");
-	let page_byte_offset = file_header.page_size * (num.get() - 1) + file_header_len;
+	let page_byte_offset = file_header.page_size * (num.get() as usize - 1) + file_header_len;
 	file.seek(std::io::SeekFrom::Start(page_byte_offset as u64))
-		.with_context(|| format!("seeking to file offset {page_byte_offset} for page {num}"))?;
+		.with_context(|| format!("seeking to file offset {page_byte_offset} for page #{num}"))?;
 
 	let mut buf = vec![0u8; file_header.page_size - file_header_len].into_boxed_slice();
 	file.read_exact(&mut buf)
-		.with_context(|| format!("reading page {num} from file offset {page_byte_offset}"))?;
+		.with_context(|| format!("reading page #{num} from file offset {page_byte_offset}"))?;
 
-	assert_eq!(buf[0], 0x0d, "only supporting leaf table b-tree pages right now");
+	let kind = PageKind::try_from((buf[0], buf.as_ref())).context("parsing page kind")?;
 	let num_cells = u16::from_be_bytes(buf[3..5].try_into().unwrap()) as usize;
 	let cells_offset = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
 
-	Ok(Page { file_header: None, num_cells, cells_offset, buf })
+	Ok(Page { num, file_header: None, kind, num_cells, cells_offset, buf })
+}
+
+#[derive(thiserror::Error, Debug)]
+enum PageKindError {
+	#[error("invalid page kind `0x{0:02x}`")]
+	Invalid(u8),
+	#[error("invalid page length: expected at least {expected} bytes, but found {found}")]
+	BufLen { expected: usize, found: usize },
+}
+
+impl TryFrom<(u8, &[u8])> for PageKind {
+	type Error = PageKindError;
+	fn try_from((byte, page_buf): (u8, &[u8])) -> Result<Self, Self::Error> {
+		match byte {
+			0x0d => Ok(Self::LeafTable),
+			0x05 => {
+				if page_buf.len() < 12 {
+					return Err(PageKindError::BufLen { expected: 12, found: page_buf.len() })
+				}
+				let rightmost_page = u32::from_be_bytes(page_buf[8..12].try_into().unwrap()) as u64;
+				Ok(Self::InteriorTable { _rightmost_page: rightmost_page })
+			}
+			_ => Err(PageKindError::Invalid(byte))
+		}
+	}
 }
 
 struct Header {
@@ -594,8 +770,7 @@ fn parse_header(database_path: &Path) -> anyhow::Result<(Header, File)> {
 	anyhow::ensure!(file_size == num_pages * page_size,
 		"expected file size of {} bytes, but found {file_size}", num_pages * page_size);
 
-	let freelist_page = u32::from_be_bytes(buf[32..36].try_into().unwrap());
-	anyhow::ensure!(freelist_page == 0, "expected no freelist page");
+	let _freelist_page = u32::from_be_bytes(buf[32..36].try_into().unwrap());
 
 	Ok((Header { page_size, _num_pages: num_pages, buf }, file))
 }
