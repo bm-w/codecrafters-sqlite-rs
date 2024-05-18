@@ -39,6 +39,15 @@ pub(crate) enum PageKind {
 	InteriorTable { _rightmost_page: u64 },
 }
 
+impl PageKind {
+	pub(crate) fn header_len(&self) -> usize {
+		match self {
+			Self::InteriorTable { .. } => 12,
+			Self::LeafTable => 8,
+		}
+	}
+}
+
 pub(crate) struct Page {
 	pub(crate) num: NonZeroU64,
 	pub(crate) file_header: Option<Header>,
