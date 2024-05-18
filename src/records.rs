@@ -1,4 +1,4 @@
-use std::{fs::File, iter::FusedIterator, num::NonZeroU64};
+use std::{fs::File, iter::{Enumerate, FusedIterator, StepBy}, num::NonZeroU64};
 
 use anyhow::Context as _;
 use itertools::Itertools as _;
@@ -17,8 +17,8 @@ pub(crate) struct Cell<'a> {
 // Page cells
 
 struct PageCellsState {
-	byte_offset: usize,
-	idxs: std::ops::Range<usize>,
+	file_header_len: usize, // 0 or 100
+	indexed_cell_ptr_offsets: Enumerate<StepBy<std::ops::Range<usize>>>,
 }
 
 pub(crate) struct PageCells<'a> {
@@ -28,45 +28,53 @@ pub(crate) struct PageCells<'a> {
 
 impl PageCellsState {
 	fn next<'a>(&mut self, page: &'a Page) -> Option<(usize, anyhow::Result<Cell<'a>>)> {
-		fn inner<'a>(state: &mut PageCellsState, page: &'a Page) -> anyhow::Result<Cell<'a>> {
-			let (rowid_offset, left_page, payload_len) = match page.kind {
+		fn inner(page: &Page, file_header_len: usize, mut offset: usize)
+		-> anyhow::Result<Cell> {
+			anyhow::ensure!(page.buf.len() >= offset + 2,
+				"expected page length of at least {} bytes, but found {}",
+				file_header_len + offset + 2,
+				file_header_len + page.buf.len());
+
+			offset = u16::from_be_bytes(page.buf[offset..offset + 2].try_into().unwrap()) as usize;
+			// The offset is relative to the start of the persisted page, which may include the file
+			// header; but in this impl. the file header is held separately from the page.
+			offset -= file_header_len;
+
+			let (left_page, payload_len) = match page.kind {
 				PageKind::InteriorTable { .. } => {
-					anyhow::ensure!(page.buf.len() >= state.byte_offset + 4,
+					anyhow::ensure!(page.buf.len() >= offset + 4,
 						"expected page length of at least {} bytes, but found {}",
-						state.byte_offset + 4,
-						page.buf.len());
-					let left_page = u32::from_be_bytes(
-						page.buf[state.byte_offset..state.byte_offset + 4].try_into()
-							.unwrap()) as u64;
+						file_header_len + offset + 4,
+						file_header_len + page.buf.len());
+					let left_page = u32::from_be_bytes(page.buf[offset..offset + 4]
+						.try_into().unwrap()) as u64;
+					offset += 4;
 					let left_page = left_page.try_into()
 						.context("expected non-zero left page number")?;
-					(state.byte_offset + 4, Some(left_page), 0)
+					(Some(left_page), 0)
 				}
 				PageKind::LeafTable => {
-					let (size, payload_len) = Varint::parse(&page.buf[state.byte_offset..])
+					let (size, payload_len) = Varint::parse(&page.buf[offset..])
 						.context("parsing first cell’s payload size `varint`")?;
+					offset += size;
 					let payload_len = payload_len.0 as usize;
-					(state.byte_offset + size, None, payload_len)
+					(None, payload_len)
 				}
 			};
 
-			let (size, rowid) = Varint::parse(&page.buf[rowid_offset..])
+			let (size, rowid) = Varint::parse(&page.buf[offset..])
 				.context("parsing cell’s rowid `varint`")?;
 			let rowid: u64 = rowid.0.try_into().context("expected non-negative `rowid`")?;
 			let rowid = rowid.try_into().context("expected non-zero `rowid`")?;
+			offset += size;
 
-			let payload_offset = rowid_offset + size;
-
-			state.byte_offset = payload_offset + payload_len;
-
-			let payload = &page.buf[payload_offset..payload_offset + payload_len];
-			Ok(Cell { left_page, rowid, payload })
+			Ok(Cell { left_page, rowid, payload: &page.buf[offset..offset + payload_len] })
 		}
 
-		let cell_idx = self.idxs.next()?;
-		let next = inner(self, page)
+		let (cell_idx, offset) = self.indexed_cell_ptr_offsets.next()?;
+		let next = inner(page, self.file_header_len, offset)
 			.with_context(|| format!("parsing page #{} cell {cell_idx}", page.num));
-		if next.is_err() { self.idxs.by_ref().for_each(drop) } // Fuse
+		if next.is_err() { self.indexed_cell_ptr_offsets.by_ref().for_each(drop) } // Fuse
 		Some((cell_idx, next))
 	}
 }
@@ -83,14 +91,16 @@ impl FusedIterator for PageCells<'_> {}
 impl Page {
 	fn parse_cells(&self) -> anyhow::Result<PageCells> {
 		let file_header_len = self.file_header.as_ref().map(|h| h.buf.len()).unwrap_or(0);
-		let cell_offset = self.cells_offset - file_header_len;
 
-		anyhow::ensure!(self.buf.len() >= cell_offset,
+		let cell_ptrs_offset = self.kind.header_len();
+		let cell_ptrs_end = cell_ptrs_offset + self.num_cells * 2;
+		anyhow::ensure!(self.buf.len() >= cell_ptrs_end,
 			"expected page size of at least {} bytes, but found {}",
-			self.cells_offset,
-			self.buf.len() + file_header_len);
+			file_header_len + cell_ptrs_end,
+			file_header_len + self.buf.len());
 
-		let state = PageCellsState { byte_offset: cell_offset, idxs: 0..self.num_cells };
+		let indexed_cell_ptr_offsets = (cell_ptrs_offset..cell_ptrs_end).step_by(2).enumerate();
+		let state = PageCellsState { file_header_len, indexed_cell_ptr_offsets };
 		Ok(PageCells { page: self, state })
 	}
 }
