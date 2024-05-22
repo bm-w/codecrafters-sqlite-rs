@@ -1,27 +1,13 @@
-# DON'T EDIT THIS!
-#
-# Codecrafters relies on this file being intact to run tests successfully. Any changes
-# here will not reflect when CodeCrafters tests your code, and might even cause build
-# failures.
-#
-# DON'T EDIT THIS!
 [package]
-name = "sqlite-starter-rust"
+name = "codecrafters-sqlite"
 version = "0.1.0"
-authors = ["Codecrafters <hello@codecrafters.io>"]
+authors = [
+	"Codecrafters <hello@codecrafters.io>",
+	"Bastiaan M. van de Weerd <bastiaan+git@bm-w.eu>",
+]
 edition = "2021"
 
-# DON'T EDIT THIS!
-#
-# Codecrafters relies on this file being intact to run tests successfully. Any changes
-# here will not reflect when CodeCrafters tests your code, and might even cause build
-# failures.
-#
-# DON'T EDIT THIS!
 [dependencies]
-anyhow = "1.0.59"    # error handling
-itertools = "0.12.1" # useful iterator extensions
-nom = "7.0.0"        # for parsing
-peg = "0.7.0"        # for parsing
-regex = "1.5.4"      # for parsing
-thiserror = "1.0.32" # error handling
+anyhow = "1.0.59"
+itertools = "0.12.1"
+thiserror = "1.0.32"
