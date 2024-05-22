@@ -35,16 +35,28 @@ impl Header {
 
 
 pub(crate) enum PageKind {
+	InteriorIndex { rightmost_page: NonZeroU64 },
+	#[allow(dead_code)]
+	InteriorTable { rightmost_page: NonZeroU64 },
+	LeafIndex,
 	LeafTable,
-	InteriorTable { _rightmost_page: u64 },
 }
 
 impl PageKind {
+	pub(crate) fn is_interior(&self) -> bool {
+		matches!(self, Self::InteriorIndex { .. } | Self::InteriorTable { .. })
+	}
+
 	pub(crate) fn header_len(&self) -> usize {
-		match self {
-			Self::InteriorTable { .. } => 12,
-			Self::LeafTable => 8,
-		}
+		if self.is_interior() { 12 } else { 8 }
+	}
+
+	pub(crate) fn is_index(&self) -> bool {
+		matches!(self, Self::InteriorIndex { .. } | Self::LeafIndex)
+	}
+
+	pub(crate) fn is_table(&self) -> bool {
+		matches!(self, Self::InteriorTable { .. } | Self::LeafTable)
 	}
 }
 
@@ -53,7 +65,7 @@ pub(crate) struct Page {
 	pub(crate) file_header: Option<Header>,
 	pub(crate) kind: PageKind,
 	pub(crate) num_cells: usize,
-	pub(crate) cells_offset: usize,
+	pub(crate) _cells_offset: usize,
 	pub(crate) buf: Box<[u8]>,
 }
 
@@ -89,14 +101,27 @@ impl Page {
 		let num_cells = u16::from_be_bytes(buf[3..5].try_into().unwrap()) as usize;
 		let cells_offset = u16::from_be_bytes(buf[5..7].try_into().unwrap()) as usize;
 
-		Ok(Page { num, file_header: None, kind, num_cells, cells_offset, buf })
+		Ok(Page { num, file_header: None, kind, num_cells, _cells_offset: cells_offset, buf })
 	}
+
+	pub(crate) fn rightmost_page(&self) -> Option<NonZeroU64> {
+		match self.kind {
+			| PageKind::InteriorIndex { rightmost_page }
+			| PageKind::InteriorTable { rightmost_page }
+				=> Some(rightmost_page),
+			_ => None,
+		}
+	}
+
+	// pub(crate) fn 
 }
 
 #[derive(thiserror::Error, Debug)]
 pub(crate) enum PageKindError {
 	#[error("invalid page kind `0x{0:02x}`")]
 	Invalid(u8),
+	#[error("invalid zero value for right-most page")]
+	ZeroRightmostPage,
 	#[error("invalid page length: expected at least {expected} bytes, but found {found}")]
 	BufLen { expected: usize, found: usize },
 }
@@ -105,14 +130,18 @@ impl TryFrom<(u8, &[u8])> for PageKind {
 	type Error = PageKindError;
 	fn try_from((byte, page_buf): (u8, &[u8])) -> Result<Self, Self::Error> {
 		match byte {
-			0x0d => Ok(Self::LeafTable),
-			0x05 => {
+			0x02 | 0x05 => {
 				if page_buf.len() < 12 {
 					return Err(PageKindError::BufLen { expected: 12, found: page_buf.len() })
 				}
 				let rightmost_page = u32::from_be_bytes(page_buf[8..12].try_into().unwrap()) as u64;
-				Ok(Self::InteriorTable { _rightmost_page: rightmost_page })
+				let rightmost_page = rightmost_page.try_into()
+					.map_err(|_| PageKindError::ZeroRightmostPage)?;
+				Ok(if byte == 0x02 { Self::InteriorIndex { rightmost_page } }
+					else { Self::InteriorTable { rightmost_page } })
 			}
+			0x0a => Ok(Self::LeafIndex),
+			0x0d => Ok(Self::LeafTable),
 			_ => Err(PageKindError::Invalid(byte))
 		}
 	}

@@ -123,7 +123,7 @@ pub(crate) struct SqlCreateColumn<'a> {
 }
 
 impl<'a> SqlCreateColumn<'a> {
-	pub(crate) fn parse(table_name: &'a str, mut sql: &'a str)
+	pub(crate) fn parse_table(table_name: &str, mut sql: &'a str)
 	-> anyhow::Result<impl Iterator<Item = anyhow::Result<Self>>> {
 		sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
 		anyhow::ensure!(sql.len() >= 6 && sql[..6].eq_ignore_ascii_case("create"),
@@ -145,7 +145,7 @@ impl<'a> SqlCreateColumn<'a> {
 			if sql.is_empty() { return None }
 
 			fn inner<'a>(sql: &mut &'a str) -> anyhow::Result<SqlCreateColumn<'a>> {
-				let (col_name, rest) = sql.split_once(|c: char| c.is_ascii_whitespace())
+				let (name, rest) = sql.split_once(|c: char| c.is_ascii_whitespace())
 					.context("expected <column name> token followed by whitespace")?;
 				let end = rest.find(|c: char| c == ',' || c == ')')
 					.context("expected ',' (comma, column delimiter) \
@@ -153,7 +153,59 @@ impl<'a> SqlCreateColumn<'a> {
 				// TODO: More robust parsing
 				let is_rowid = rest[..end].to_ascii_lowercase().contains("integer primary key");
 				*sql = rest[end + 1..].trim_start_matches(|c: char| c.is_ascii_whitespace());
-				Ok(SqlCreateColumn { name: col_name.into(), is_rowid_alias: is_rowid })
+				Ok(SqlCreateColumn { name: name.into(), is_rowid_alias: is_rowid })
+			}
+			Some(inner(&mut sql))
+		}))
+	}
+
+	pub(crate) fn parse_index(index_name: &str, table_name: &str, mut sql: &'a str)
+	-> anyhow::Result<impl Iterator<Item = anyhow::Result<Self>>> {
+		sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+		anyhow::ensure!(sql.len() >= 6 && sql[..6].eq_ignore_ascii_case("create"),
+			"expected `CREATE` token");
+		sql = sql[6..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+		anyhow::ensure!(sql.len() >= 5 && sql[..5].eq_ignore_ascii_case("index"),
+			"expected `INDEX` token");
+		sql = sql[5..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+		let (is_quoted, mut sql) = sql.strip_prefix('"')
+			.map(|sql| (true, sql)).unwrap_or((false, sql));
+		sql = sql.strip_prefix(index_name).context("expected index name token")?;
+		if is_quoted { sql = sql.strip_prefix('"')
+			.context("expected closing quotation mark '\"'")? }
+		sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+		anyhow::ensure!(sql.len() >= 2 && sql[..2].eq_ignore_ascii_case("on"),
+			"expected `ON` token");
+		sql = sql[2..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+		let (is_quoted, mut sql) = sql.strip_prefix('"')
+			.map(|sql| (true, sql)).unwrap_or((false, sql));
+		sql = sql.strip_prefix(table_name).context("expected table name token")?;
+		if is_quoted { sql = sql.strip_prefix('"')
+			.context("expected closing quotation mark '\"'")? }
+		sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+		sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+		sql = sql.strip_prefix('(').context("expected '(' (left parenthesis) token")?;
+		sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
+
+		Ok(std::iter::from_fn(move || {
+			if sql.is_empty() { return None }
+
+			fn inner<'a>(sql: &mut &'a str) -> anyhow::Result<SqlCreateColumn<'a>> {
+				let end = sql.find(|c: char| c == ',' || c == ')' || c.is_ascii_whitespace())
+					.context("expected end of column name")?;
+				let (name, rest) = sql.split_at(end);
+				let rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+				let end = rest.find(|c: char| c == ',' || c == ')')
+					.context("expected ',' (comma, column delimiter) \
+							or ')' (right parenthesis) token")?;
+				*sql = rest[end + 1..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+				Ok(SqlCreateColumn { name: name.into(), is_rowid_alias: false })
 			}
 			Some(inner(&mut sql))
 		}))
