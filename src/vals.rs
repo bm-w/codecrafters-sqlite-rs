@@ -30,7 +30,7 @@ impl Varint {
 		}
 
 		// SAFETY: Transmuting `u64` to `i64` is always safe.
-		Ok((offset + 1, Self(unsafe { std::mem::transmute(bits) })))
+		Ok((offset + 1, Self(unsafe { std::mem::transmute::<u64, i64>(bits) })))
 	}
 }
 
@@ -130,6 +130,12 @@ impl std::fmt::Display for Type {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn varint() -> anyhow::Result<()> {
+		assert_eq!(Varint::parse(&[0x8a, 0xd7, 0x14])?.1.0, 174996);
+		Ok(())
+	}
 
 	#[test]
 	fn i24() -> anyhow::Result<()> {

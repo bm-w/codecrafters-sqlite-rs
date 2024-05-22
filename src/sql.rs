@@ -52,7 +52,7 @@ impl<'a> TryFrom<&'a str> for SqlSelect<'a> {
 				}
 				let end_sql = sql.trim_start_matches(|c: char| c.is_ascii_whitespace());
 				if !end_sql.starts_with(',') { break }
-				sql = &end_sql[1..].trim_start_matches(|c: char| c.is_ascii_whitespace());
+				sql = end_sql[1..].trim_start_matches(|c: char| c.is_ascii_whitespace());
 			}
 			(acc.into(), sql)
 		};
